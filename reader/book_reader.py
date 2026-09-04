@@ -950,6 +950,23 @@ if(syList){
       '<div class="ag-empty">Всё совпадает с ENOT.</div>';
     window.__syPending=rows.filter(r=>r.state==='changed'||r.state==='new')
       .map(r=>r.rel);
+
+    /* документы без коллекции: группируем по папке — указывать её
+       каждому файлу отдельно было бы двадцать нажатий вместо одного */
+    const orphans=(d.rows||[]).filter(r=>r.state==='no-id');
+    const byDir={};
+    orphans.forEach(r=>{
+      const dir=r.rel.includes('/')?r.rel.slice(0,r.rel.lastIndexOf('/')):'.';
+      (byDir[dir]=byDir[dir]||[]).push(r);
+    });
+    const ob=$('#sy-orphans');
+    const dirs=Object.keys(byDir).sort();
+    ob.innerHTML=dirs.length?dirs.map(dir=>
+      '<div class="sy" data-dir="'+encodeURIComponent(dir)+'">'+
+      '<div class="col"><div class="nm">'+(dir==='.'?'корень базы':dir)+'</div>'+
+      '<div class="sub">документов: '+byDir[dir].length+'</div></div>'+
+      '<button data-a="bind">указать коллекцию</button></div>').join(''):
+      '<div class="ag-empty">Все документы знают свою коллекцию.</div>';
   };
 
   const loadSync=async()=>{
@@ -1007,6 +1024,57 @@ if(syList){
     loadSync();
   });
 
+  /* коллекции: список для выбора и создание новой */
+  const collSel=$('#sy-coll');
+  const loadColls=async()=>{
+    try{
+      const r=await fetch('/api/collections');
+      const d=await r.json();
+      if(!d.ok){collSel.innerHTML='<option value="">'+(d.error||'не вышло')+'</option>';return}
+      collSel.innerHTML='<option value="">— выберите коллекцию —</option>'+
+        (d.items||[]).map(c=>'<option value="'+c.id+'">'+c.name+'</option>').join('');
+    }catch(e){collSel.innerHTML='<option value="">сервер не ответил</option>'}
+  };
+
+  $('#sy-mkcoll')?.addEventListener('click',async e=>{
+    const name=($('#sy-newcoll').value||'').trim();
+    if(!name){say2('нужно имя коллекции','bad');return}
+    e.currentTarget.disabled=true;
+    try{
+      const r=await fetch('/api/collections',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:'create',name})});
+      const j=await r.json();
+      if(!r.ok||!j.ok){say2(j.error||'не вышло','bad')}
+      else{
+        say2('создана коллекция: '+(j.item&&j.item.name||name),'ok');
+        $('#sy-newcoll').value='';
+        await loadColls();
+        if(j.item&&j.item.id)collSel.value=j.item.id;
+      }
+    }catch(err){say2('сервер не ответил','bad')}
+    e.currentTarget.disabled=false;
+  });
+
+  $('#sy-orphans')?.addEventListener('click',async e=>{
+    const b=e.target.closest('button[data-a="bind"]');
+    if(!b)return;
+    const cid=collSel.value;
+    if(!cid){say2('сначала выберите коллекцию','bad');return}
+    const dir=decodeURIComponent(b.closest('.sy').dataset.dir);
+    b.disabled=true;
+    try{
+      const r=await fetch('/api/collections',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:'bind',p:dir==='.'?'':dir,collection:cid})});
+      const j=await r.json();
+      if(!r.ok||!j.ok){say2(j.error||'не вышло','bad');b.disabled=false;return}
+      say2('коллекция указана документам: '+j.count,'ok');
+      loadSync();
+    }catch(err){say2('сервер не ответил','bad');b.disabled=false}
+  });
+
+  loadColls();
   loadSync();
 }
 })();
@@ -1262,6 +1330,10 @@ def sync_page():
             '<p class="ag-lead">Файлы — источник правды, ENOT — витрина. '
             'Выгрузка идёт в одну сторону: из базы в ENOT. Что изменилось после '
             'прошлой выгрузки, видно по отпечатку текста — без обращения к сети.</p>'
+            '<p class="ag-hint">Документ не правится, а заменяется: создаётся '
+            'новый, прежний уходит в архив. Иначе ENOT срезает разметку — это '
+            'поведение его API, проверено опытом. Прямая ссылка на документ '
+            'после выгрузки меняется.</p>'
             '<div class="ag-row" id="sy-top">'
             '<button id="sy-reload">обновить список</button>'
             '<button id="sy-all" class="prim">выгрузить всё изменённое</button>'
@@ -1269,6 +1341,20 @@ def sync_page():
             '</div>'
             '<div id="sy-counts" class="sy-counts"></div>'
             '<div id="sy-list" class="ag-list">загружаю…</div>'
+            '<h2 class="ag-h">Документы без коллекции</h2>'
+            '<p class="ag-hint">Файлы, которые родились локально, а не пришли '
+            'из ENOT: выгружать их некуда, пока не указана коллекция. Выберите '
+            'её для всей папки сразу.</p>'
+            '<div class="ag-form" id="sy-noid">'
+            '<label>Коллекция ENOT'
+            '<select id="sy-coll"><option value="">загружаю…</option></select>'
+            '</label>'
+            '<div class="ag-row">'
+            '<input id="sy-newcoll" placeholder="или создать новую: имя коллекции">'
+            '<button id="sy-mkcoll">создать</button>'
+            '</div>'
+            '<div id="sy-orphans" class="ag-list"></div>'
+            '</div>'
             '</div>')
 
 
@@ -1587,6 +1673,15 @@ class Handler(BaseHTTPRequestHandler):
                         'key': bool(sync_yonote.api_key(CFG))})
             return
 
+        if u.path == '/api/collections':
+            """Коллекции ENOT: куда выгружать документы без отметок."""
+            items, err = sync_yonote.collections(CFG)
+            if err:
+                self._json({'ok': False, 'error': err}, code=502)
+                return
+            self._json({'ok': True, 'items': items})
+            return
+
         self._send('<h1>404</h1>', code=404)
 
     # ------------------------------------------------------------ запись
@@ -1809,6 +1904,61 @@ class Handler(BaseHTTPRequestHandler):
             refresh(force=True)
             self._json({'ok': True, 'message': msg,
                         'url': sync_yonote.doc_url(full, CFG)})
+            return
+
+        if u.path == '/api/collections':
+            """Коллекции: создать новую или указать документу, куда выгружать."""
+            act = (data.get('act') or '').strip()
+
+            if act == 'create':
+                item, err = sync_yonote.create_collection(
+                    data.get('name') or '', CFG,
+                    description=(data.get('description') or ''))
+                if err:
+                    self._json({'ok': False, 'error': err}, code=502)
+                    return
+                self._json({'ok': True, 'item': item})
+                return
+
+            if act == 'bind':
+                rel = (data.get('p') or '').strip()
+                cid = (data.get('collection') or '').strip()
+                if not cid:
+                    self._json({'ok': False, 'error': 'не выбрана коллекция'},
+                               code=400)
+                    return
+                # весь каталог сразу: по одному документу указывать коллекцию
+                # для папки Docs — двадцать нажатий вместо одного
+                target = safe_path(rel)
+                if not target or not os.path.exists(target):
+                    self._json({'ok': False, 'error': 'Не найдено'}, code=404)
+                    return
+
+                files = []
+                if os.path.isdir(target):
+                    for dirpath, dirnames, filenames in os.walk(target):
+                        dirnames[:] = [d for d in dirnames
+                                       if not d.startswith(('_', '.'))
+                                       and d != 'Backup']
+                        files += [os.path.join(dirpath, f)
+                                  for f in sorted(filenames)
+                                  if f.endswith('.md') and f != 'README.md']
+                else:
+                    files = [target]
+
+                done = 0
+                for f in files:
+                    st, _ = sync_yonote.state_of(f)
+                    if st == sync_yonote.EMPTY:
+                        continue
+                    sync_yonote.bind_collection(f, cid,
+                                                (data.get('parent') or ''))
+                    done += 1
+                refresh(force=True)
+                self._json({'ok': True, 'count': done})
+                return
+
+            self._json({'ok': False, 'error': 'неизвестное действие'}, code=400)
             return
 
         self._json({'ok': False, 'error': 'Неизвестный запрос'}, code=404)

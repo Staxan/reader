@@ -191,6 +191,11 @@ a.tb{text-decoration:none;justify-content:center}
   border:1px solid var(--line);background:var(--panel2);color:var(--tx);
   font-size:13px;font-family:var(--sans)}
 .ag-form input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accsoft)}
+.ag-form select{height:33px;padding:0 9px;border-radius:8px;outline:0;
+  border:1px solid var(--line);background:var(--panel2);color:var(--tx);
+  font-size:13px;font-family:var(--sans)}
+.ag-form select:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accsoft)}
+.ag-row input{flex:1;min-width:220px}
 .ag-row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .ag-row button{height:31px;padding:0 13px;border-radius:8px;cursor:pointer;
   border:1px solid var(--line);background:var(--panel2);color:var(--tx2);

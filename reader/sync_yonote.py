@@ -237,20 +237,86 @@ def survey(base_dir, skip=('Backup',)):
     return out
 
 
+# ---------------------------------------------------------------- коллекции
+
+
+def collections(cfg=None):
+    """Список коллекций с именами. -> ([{'id', 'name'}], ошибка).
+
+    `collections.list` имён не отдаёт — приходится дозапрашивать каждую через
+    `collections.info`. Медленно, зато честно: без имён список бесполезен.
+    """
+    cfg = cfg if cfg is not None else settings.load()
+    res, err = call('collections.list', {'limit': 100, 'offset': 0}, cfg)
+    if err:
+        return [], err
+
+    out = []
+    for c in (res.get('data') or []):
+        cid = c.get('id')
+        if not cid:
+            continue
+        name = (c.get('name') or '').strip()
+        if not name:
+            info, e2 = call('collections.info', {'id': cid}, cfg)
+            if not e2:
+                name = ((info.get('data') or {}).get('name') or '').strip()
+        out.append({'id': cid, 'name': name or '(без имени)'})
+    out.sort(key=lambda x: x['name'].lower())
+    return out, ''
+
+
+def create_collection(name, cfg=None, description=''):
+    """Создаёт коллекцию. -> (запись, ошибка)."""
+    cfg = cfg if cfg is not None else settings.load()
+    name = (name or '').strip()
+    if not name:
+        return None, 'нужно имя коллекции'
+    res, err = call('collections.create',
+                    {'name': name, 'description': description}, cfg)
+    if err:
+        return None, err
+    data = (res.get('data') or {})
+    if not data.get('id'):
+        return None, 'ENOT не вернул id коллекции'
+    return {'id': data['id'], 'name': data.get('name') or name}, ''
+
+
+def bind_collection(path, collection_id, parent_id=''):
+    """Прописывает коллекцию в front-matter — куда выгружать этот документ.
+
+    Нужно для файлов, родившихся локально: у них нет отметок ENOT, и без
+    коллекции выгружать некуда.
+    """
+    upd = {'collection_id': (collection_id or '').strip()}
+    if parent_id:
+        upd['parent_id'] = parent_id.strip()
+    return write_front(path, upd)
+
+
 # ---------------------------------------------------------------- выгрузка
 
 
 def push(path, cfg=None, force=False):
     """Выгружает документ в ENOT. -> (получилось, сообщение).
 
-    Существующий документ обновляется по yonote_id, новый создаётся в своей
-    коллекции. После записи результат перечитывается: ответ на create/update
-    может выглядеть успешным, а текст в ENOT — не тем.
+    Документ не обновляется, а заменяется: создаётся новый, прежний уходит в
+    архив. Так приходится делать из-за поведения API — проверено опытом:
+
+        documents.create  сохраняет markdown полностью;
+        documents.update  срезает решётки, жирный и списки.
+
+    Обойти параметрами (`append`, `title`, `done`) не удалось. Поэтому единственный
+    способ довезти разметку до ENOT — всегда создавать заново.
+
+    Цена: у документа меняется `urlId`, прежняя прямая ссылка перестаёт
+    работать. Новый адрес пишется в front-matter сразу после выгрузки.
     """
     cfg = cfg if cfg is not None else settings.load()
     st, meta = state_of(path)
     if st == NO_ID:
-        return False, 'в файле нет collection_id — непонятно, куда выгружать'
+        return False, ('не указана коллекция ENOT — выберите её на странице '
+                       'выгрузки')
     if st == EMPTY:
         return False, ('в файле нет текста — это папка-заголовок; выгрузка '
                        'затёрла бы содержимое в ENOT')
@@ -260,27 +326,21 @@ def push(path, cfg=None, force=False):
     _, _, text = read_front(path)
     payload_text = prepare_text(text)
     title = title_of(path, meta)
-    yid = (meta.get('yonote_id') or '').strip()
+    old_id = (meta.get('yonote_id') or '').strip()
 
-    if yid:
-        _, err = call('documents.update',
-                      {'id': yid, 'title': title, 'text': payload_text,
-                       'publish': True}, cfg)
-        if err:
-            return False, err
-    else:
-        payload = {'title': title, 'text': payload_text,
-                   'collectionId': (meta.get('collection_id') or '').strip(),
-                   'publish': True}
-        parent = (meta.get('parent_id') or '').strip()
-        if parent:
-            payload['parentDocumentId'] = parent
-        res, err = call('documents.create', payload, cfg)
-        if err:
-            return False, err
-        yid = ((res or {}).get('data') or {}).get('id') or ''
-        if not yid:
-            return False, 'ENOT не вернул id созданного документа'
+    payload = {'title': title, 'text': payload_text,
+               'collectionId': (meta.get('collection_id') or '').strip(),
+               'publish': True}
+    parent = (meta.get('parent_id') or '').strip()
+    if parent:
+        payload['parentDocumentId'] = parent
+
+    res, err = call('documents.create', payload, cfg)
+    if err:
+        return False, err
+    yid = ((res or {}).get('data') or {}).get('id') or ''
+    if not yid:
+        return False, 'ENOT не вернул id созданного документа'
 
     # проверка: читаем то, что легло в ENOT
     res, err = call('documents.info', {'id': yid}, cfg)
@@ -291,6 +351,13 @@ def push(path, cfg=None, force=False):
     if not got:
         return False, 'в ENOT документ пустой — выгрузка не удалась'
 
+    # прежний документ в архив: два одинаковых в одной папке — хуже, чем ни одного.
+    # Делается только после того, как новый проверен.
+    archived = ''
+    if old_id and old_id != yid:
+        _, e2 = call('documents.archive', {'id': old_id}, cfg)
+        archived = '; прежний в архиве' if not e2 else f'; прежний не убрался ({e2})'
+
     # ссылки: они должны остаться видимыми
     lost = [u for u in re.findall(r'https?://[^\s<>)\]]+', payload_text)
             if u not in got]
@@ -298,13 +365,13 @@ def push(path, cfg=None, force=False):
 
     write_front(path, {
         'yonote_id': yid,
-        'url_id': data.get('urlId') or meta.get('url_id') or '',
+        'url_id': data.get('urlId') or '',
         'status': 'synced',
         'synced_at': date.today().isoformat(),
         'synced_hash': body_hash(path),
     })
     where = f'{len(got)} знаков'
-    return True, f'выгружено в ENOT ({where}){warn}'
+    return True, f'выгружено в ENOT ({where}){archived}{warn}'
 
 
 def doc_url(path, cfg=None):
