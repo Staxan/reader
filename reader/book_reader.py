@@ -928,7 +928,7 @@ if(syList){
   const msg=$('#sy-msg');
   const say2=(t,cls)=>{msg.textContent=t;msg.className='ag-msg'+(cls?' '+cls:'')};
   const RU={changed:'изменён',new:'нет в ENOT',same:'совпадает',
-    'no-id':'нет коллекции'};
+    'no-id':'нет коллекции',empty:'папка без текста'};
 
   const row=r=>{
     const can=r.state==='changed'||r.state==='new';
@@ -942,10 +942,10 @@ if(syList){
   const draw=d=>{
     const c=d.counts||{};
     $('#sy-counts').innerHTML=
-      ['changed','new','same','no-id'].filter(k=>c[k]).map(
+      ['changed','new','same','no-id','empty'].filter(k=>c[k]).map(
         k=>'<span class="'+k+'">'+(RU[k]||k)+': '+c[k]+'</span>').join('')+
       (d.key?'':'<span class="changed">ключ доступа не найден</span>');
-    const rows=(d.rows||[]).filter(r=>r.state!=='same');
+    const rows=(d.rows||[]).filter(r=>r.state==='changed'||r.state==='new');
     syList.innerHTML=rows.map(row).join('')||
       '<div class="ag-empty">Всё совпадает с ENOT.</div>';
     window.__syPending=rows.filter(r=>r.state==='changed'||r.state==='new')
@@ -1343,12 +1343,16 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, data, ctype='text/html; charset=utf-8', code=200):
         if isinstance(data, str):
             data = data.encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', ctype)
-        self.send_header('Content-Length', str(len(data)))
-        self.send_header('Cache-Control', 'no-store')
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # браузер ушёл со страницы, не дочитав ответ — это не ошибка
+            self.close_connection = True
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -1596,6 +1600,26 @@ class Handler(BaseHTTPRequestHandler):
                        code=403)
             return False
         return True
+
+    def handle_one_request(self):
+        """То же, что в родителе, но без простыни на закрытое соединение.
+
+        Браузер закрывает соединение когда захочет: перешли на другую страницу,
+        отменили запрос, сработал keep-alive. Windows отвечает на это
+        ConnectionAbortedError (WinError 10053), и стандартный сервер печатает
+        полный traceback. Ошибки тут нет, а Андрей видит в окне пугающую
+        простыню и думает, что читалка сломалась.
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
 
     def _json(self, obj, code=200):
         self._send(json.dumps(obj, ensure_ascii=False),
@@ -1893,7 +1917,26 @@ def main():
         else:
             print('в локальной сети: чтение доступно, запись — только с этой машины')
     print('Ctrl+C — остановить.', flush=True)
-    ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
+
+    class Server(ThreadingHTTPServer):
+        """Тихий сервер: браузер вправе бросить соединение когда угодно.
+
+        Стандартный ThreadingHTTPServer на каждый обрыв печатает traceback
+        (в Windows это ConnectionAbortedError, WinError 10053). Ошибки нет, но
+        в окне читалки это выглядит как поломка. Настоящие ошибки по-прежнему
+        видны — глушим только обрывы связи.
+        """
+
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                                BrokenPipeError)):
+                return
+            super().handle_error(request, client_address)
+
+    Server((a.host, a.port), Handler).serve_forever()
 
 
 if __name__ == '__main__':

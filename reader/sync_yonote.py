@@ -150,19 +150,33 @@ def body_hash(path):
 
 
 def prepare_text(text):
-    """Готовит текст к выгрузке.
+    """Готовит текст к выгрузке: восстанавливает разметку и раскрывает ссылки.
 
-    Yonote срезает `[текст](url)` до анкера — ссылка перестаёт быть видимой.
-    Прямые URL и метки сносок `[N]` он сохраняет. Поэтому markdown-ссылки
-    разворачиваем в подпись плюс видимый адрес.
+    Главная беда была тут. Файлы базы получены выгрузкой ИЗ ENOT через API, а он
+    при чтении срезает markdown: заголовки теряют решётки, списки — дефисы,
+    абзацы — пустые строки. Читалка это терпит, потому что `structure.py`
+    распознаёт структуру по признакам самого текста. Но если такой текст
+    отправить назад, ENOT получит плоскую простыню — форматирование слетало
+    именно поэтому, а не из-за ENOT.
+
+    Поэтому перед отправкой структуру восстанавливаем: разбираем текст на блоки
+    и собираем обратно нормальный markdown. При записи ENOT разметку понимает —
+    в интерфейсе появляются заголовки, списки и абзацы.
+
+    Отдельно ссылки: `[текст](url)` ENOT срезает до анкера, и адрес пропадает.
+    Прямые URL и метки сносок `[N]` он сохраняет, поэтому markdown-ссылки
+    разворачиваем в «подпись: адрес».
     """
+    blocks = structure.parse(text)
+    md = structure.to_markdown(blocks) if blocks else text
+
     def unfold(m):
         label, url = m.group(1).strip(), m.group(2).strip()
         if label.rstrip('/') == url.rstrip('/'):
             return url
         return f'{label}: {url}'
 
-    return MD_LINK.sub(unfold, text).strip() + '\n'
+    return MD_LINK.sub(unfold, md).strip() + '\n'
 
 
 def title_of(path, meta):
@@ -175,7 +189,7 @@ def title_of(path, meta):
 # --------------------------------------------------------------- состояние
 
 
-NEW, CHANGED, SAME, NO_ID = 'new', 'changed', 'same', 'no-id'
+NEW, CHANGED, SAME, NO_ID, EMPTY = 'new', 'changed', 'same', 'no-id', 'empty'
 
 
 def state_of(path):
@@ -185,8 +199,15 @@ def state_of(path):
     changed  выгружен, но файл после этого менялся
     same     совпадает с выгруженным
     no-id    есть отметка synced, но нет ни yonote_id, ни коллекции
+    empty    в файле нет текста — это папка-заголовок (`_index.md`)
+
+    Пустые файлы выделены отдельно не для красоты: если выгрузить такой файл,
+    он затрёт текст в ENOT. Проверено на `_index.md` главы 1 — документ в ENOT
+    оказался пустым.
     """
-    meta, _, _ = read_front(path)
+    meta, _, text = read_front(path)
+    if not text.strip():
+        return EMPTY, meta
     yid = (meta.get('yonote_id') or '').strip()
     coll = (meta.get('collection_id') or '').strip()
     if not yid:
@@ -230,6 +251,9 @@ def push(path, cfg=None, force=False):
     st, meta = state_of(path)
     if st == NO_ID:
         return False, 'в файле нет collection_id — непонятно, куда выгружать'
+    if st == EMPTY:
+        return False, ('в файле нет текста — это папка-заголовок; выгрузка '
+                       'затёрла бы содержимое в ENOT')
     if st == SAME and not force:
         return True, 'уже совпадает с ENOT'
 
@@ -313,7 +337,7 @@ if __name__ == '__main__':
     for r in rows:
         by[r['state']] = by.get(r['state'], 0) + 1
     print('всего документов:', len(rows))
-    for k in (SAME, CHANGED, NEW, NO_ID):
+    for k in (SAME, CHANGED, NEW, NO_ID, EMPTY):
         if by.get(k):
             print(f'  {k}: {by[k]}')
     for r in rows:

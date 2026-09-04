@@ -224,6 +224,8 @@ a.tb{text-decoration:none;justify-content:center}
 .sy .st.changed{color:var(--gold)}
 .sy .st.new{color:var(--acc2)}
 .sy .st.same{color:var(--green)}
+.sy .st.empty,.sy .st.no-id{color:var(--dim)}
+.sy-counts span.empty,.sy-counts span.no-id{color:var(--dim)}
 .sy button{height:28px;padding:0 11px;border-radius:8px;cursor:pointer;
   border:1px solid var(--line);background:var(--panel2);color:var(--tx2);
   font-size:12px;white-space:nowrap;font-family:var(--sans)}
