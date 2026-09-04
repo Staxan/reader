@@ -1,0 +1,8 @@
+{
+ "base": "",
+ "port": 8765,
+ "host": "127.0.0.1",
+ "yonote_url": "https://anewera.yonote.ru",
+ "write_allow": [],
+ "direct_bind": "auto"
+}

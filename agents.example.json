@@ -1,0 +1,25 @@
+{
+ "default": "",
+ "agents": [
+  {
+   "id": "nika",
+   "name": "Ника",
+   "kind": "hermes-webhook",
+   "profile": "nika-redaktor",
+   "url": "http://127.0.0.1:8644/webhooks/nika-book",
+   "secret": "env:AGENT_SECRET_NIKA",
+   "command": "",
+   "enabled": true
+  },
+  {
+   "id": "gera",
+   "name": "Гера",
+   "kind": "hermes-webhook",
+   "profile": "default",
+   "url": "http://127.0.0.1:8645/webhooks/gera-book",
+   "secret": "env:AGENT_SECRET_GERA",
+   "command": "",
+   "enabled": false
+  }
+ ]
+}
