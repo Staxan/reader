@@ -231,6 +231,16 @@ a.tb{text-decoration:none;justify-content:center}
 .sy .st.same{color:var(--green)}
 .sy .st.empty,.sy .st.no-id{color:var(--dim)}
 .sy-counts span.empty,.sy-counts span.no-id{color:var(--dim)}
+/* базы: полоса загрузки и отметки в списке находок */
+.bs-prog{margin-top:6px}
+.bs-prog .bar{height:4px;border-radius:99px;background:var(--panel2);
+  overflow:hidden;border:1px solid var(--line)}
+.bs-prog .bar i{display:block;height:100%;width:0;background:var(--acc);
+  transition:width .35s ease}
+.bs-prog .txt{margin-top:7px;font-size:12px;color:var(--mut)}
+.sy input.chk{width:15px;height:15px;accent-color:var(--acc);cursor:pointer;
+  flex:0 0 auto}
+.sy .chk-off{width:15px;text-align:center;color:var(--dim);flex:0 0 auto}
 .sy button{height:28px;padding:0 11px;border-radius:8px;cursor:pointer;
   border:1px solid var(--line);background:var(--panel2);color:var(--tx2);
   font-size:12px;white-space:nowrap;font-family:var(--sans)}

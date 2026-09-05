@@ -213,6 +213,21 @@ def load():
     if env:
         cfg['base'] = env
     cfg['base'] = translate(cfg.get('base') or '')
+
+    # Открытая база из bases.json важнее поля в config.json: баз может быть
+    # несколько, и они не пересекаются. Поле `base` остаётся как запись о
+    # первой базе — на машине, где bases.json ещё не появился, всё работает
+    # по-прежнему. Импорт внутри функции: bases.py читает нас, и наверху это
+    # замкнуло бы круг.
+    if not env:
+        try:
+            import bases
+            picked = bases.current_path(cfg['base'])
+            if picked:
+                cfg['base'] = picked
+        except Exception:
+            pass
+
     if not cfg['base']:
         cfg['base'] = guess_base()
     if cfg['base']:

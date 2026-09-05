@@ -31,8 +31,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agents
+import bases
+import bgtask
 import binding
+import favicon
 import hermes_link
+import import_enot
 import jobs
 import notes
 import settings
@@ -50,6 +54,13 @@ ITEM = re.compile(r'^(\d{1,2})[.)]\s+')
 MARK_RE = re.compile(r'\[(\d+)\]')
 
 BASE = DEFAULT_BASE
+
+# Долгие дела: загрузка базы и проверка ENOT. Каждое своего вида, по одному
+# за раз — две загрузки в одну папку дают мусор.
+LOAD_TASK = bgtask.Task('загрузка базы')
+SCAN_TASK = bgtask.Task('проверка ENOT')
+# Что нашла последняя проверка: список ждёт подтверждения Андрея.
+REMOTE = {'base': '', 'rows': [], 'at': 0.0}
 
 # Дерево базы держим в памяти и обновляем фоновым потоком.
 # Обход базы с бэкапом ENOT (под тысячу файлов) на мосту WSL→Windows занимает
@@ -156,6 +167,53 @@ def watcher():
             refresh()
         except Exception:
             pass
+
+
+def use_base(path):
+    """Переключает читалку на другую базу.
+
+    BASE — одна переменная на процесс, поэтому меняем её и сразу пересобираем
+    дерево: иначе страница показывала бы документы прежней базы.
+    """
+    global BASE
+    BASE = os.path.abspath(settings.translate(path))
+    CFG['base'] = BASE
+    _TREE_CACHE['stamp'] = None
+    refresh(force=True)
+    return BASE
+
+
+def enot_watcher():
+    """Раз в час смотрит витрину: не появилось ли в ENOT нового.
+
+    Ничего не забирает — только складывает находки, чтобы страница «Базы» их
+    подсветила. Решение всегда за Андреем.
+    """
+    time.sleep(90)                     # дать читалке спокойно подняться
+    while True:
+        try:
+            b = bases.current(bases.load(CFG.get('base')))
+            if b and os.path.isdir(b['path']) and not SCAN_TASK.busy() \
+                    and sync_yonote.api_key(CFG):
+                start_scan(b)
+        except Exception:
+            pass
+        time.sleep(3600)
+
+
+def start_scan(b):
+    """Ставит проверку витрины в фон. -> (пошло ли, сообщение)."""
+    def job(task):
+        rows, err = import_enot.survey_remote(
+            b, CFG, progress=lambda t, n=0: task.say(t, n))
+        REMOTE['base'] = b['id']
+        REMOTE['rows'] = rows
+        REMOTE['at'] = time.time()
+        if err:
+            raise RuntimeError(err)
+        return {'found': len(rows)}
+
+    return SCAN_TASK.start(job, tag=b['id'])
 
 
 def flat_docs(nodes, out=None):
@@ -1077,6 +1135,190 @@ if(syList){
   loadColls();
   loadSync();
 }
+
+/* ---------------------------------------------- базы документов */
+const bsList=$('#bs-list');
+if(bsList){
+  const msg=$('#bs-msg'), cmsg=$('#bs-cmsg');
+  const say=(t,cls)=>{msg.textContent=t;msg.className='ag-msg'+(cls?' '+cls:'')};
+  const sayc=(t,cls)=>{cmsg.textContent=t;cmsg.className='ag-msg'+(cls?' '+cls:'')};
+  const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+  const SRC={enot:'из ENOT',backup:'из бэкапа',local:'создана на месте'};
+
+  const card=b=>{
+    const state=!b.exists?'<span class="st no-id">нет папки</span>':
+      (b.current?'<span class="st same">открыта</span>':'');
+    const ro=b.read_only?' · только чтение':'';
+    return '<div class="sy" data-id="'+esc(b.id)+'">'+
+      '<div class="col"><div class="nm">'+esc(b.name)+'</div>'+
+      '<div class="sub">'+esc(b.path)+'</div>'+
+      '<div class="sub">документов: '+b.docs_now+' · '+(SRC[b.source]||b.source)+
+      (b.loaded?(' · загружена '+esc(b.loaded)):'')+ro+'</div></div>'+
+      state+
+      (b.current?'':'<button data-a="open">открыть</button>')+
+      (b.docs_now?'':'<button data-a="load">загрузить</button>')+
+      '<button data-a="ro">'+(b.read_only?'разрешить выгрузку':'только чтение')+'</button>'+
+      '<button data-a="forget">убрать из списка</button></div>';
+  };
+
+  const loadBases=async()=>{
+    try{
+      const r=await fetch('/api/bases');
+      const d=await r.json();
+      bsList.innerHTML=(d.bases||[]).map(card).join('')||
+        '<div class="ag-empty">Баз пока нет.</div>';
+      $('#bs-where').textContent='список баз: '+(d.registry||'');
+      if(!d.key)say('ключ доступа к ENOT не найден — загрузка из сети недоступна','bad');
+      if(d.load&&d.load.state==='running')watchLoad();
+      if(!$('#bs-path').value&&d.suggest)$('#bs-path').placeholder=d.suggest;
+    }catch(e){bsList.innerHTML='<div class="ag-empty">Сервер не ответил.</div>'}
+  };
+
+  const prog=$('#bs-prog');
+  const watchLoad=async()=>{
+    prog.hidden=false;
+    const bar=prog.querySelector('i'), txt=prog.querySelector('.txt');
+    let stop=false;
+    while(!stop){
+      let d;
+      try{
+        const r=await fetch('/api/bases/load');
+        d=(await r.json()).task||{};
+      }catch(e){txt.textContent='сервер не ответил';break}
+      txt.textContent=(d.text||'')+(d.seconds?('  ·  '+d.seconds+' с'):'');
+      /* полосу двигаем по числу записанных: общего числа заранее нет,
+         поэтому показываем ход, а не долю */
+      bar.style.width=Math.min(97,(d.n||0)/9)+'%';
+      if(d.state==='done'){bar.style.width='100%';say('загрузка закончена','ok');stop=true}
+      else if(d.state==='error'){txt.textContent=d.error||'не вышло';say('загрузка не удалась','bad');stop=true}
+      else await new Promise(r=>setTimeout(r,1200));
+    }
+    loadBases();
+  };
+
+  $('#bs-src')?.addEventListener('change',e=>{
+    $('#bs-fromwrap').style.display=e.target.value==='backup'?'flex':'none';
+  });
+
+  $('#bs-make')?.addEventListener('click',async e=>{
+    const name=($('#bs-name').value||'').trim();
+    const path=($('#bs-path').value||'').trim();
+    const source=$('#bs-src').value;
+    const from=($('#bs-from').value||'').trim();
+    if(!name||!path){say('нужно имя базы и папка','bad');return}
+    if(!confirm('Создать базу «'+name+'»?\nПапка: '+path+
+      '\n\nЗагрузка идёт один раз и ничего не перезаписывает.'))return;
+    e.currentTarget.disabled=true;
+    say('создаю…');
+    try{
+      const r=await fetch('/api/bases',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:'create',name,path,source,from})});
+      const j=await r.json();
+      if(!r.ok||!j.ok){say(j.error||'не вышло','bad')}
+      else{
+        say(j.message||'готово','ok');
+        $('#bs-name').value='';$('#bs-path').value='';
+        if(j.loading)watchLoad(); else loadBases();
+      }
+    }catch(err){say('сервер не ответил','bad')}
+    e.currentTarget.disabled=false;
+  });
+
+  bsList.addEventListener('click',async e=>{
+    const b=e.target.closest('button[data-a]');
+    if(!b)return;
+    const box=b.closest('.sy'), id=box.dataset.id;
+    const act=b.dataset.a, name=box.querySelector('.nm').textContent;
+    if(act==='forget'&&!confirm('Убрать «'+name+'» из списка?\n'+
+      'Файлы останутся на диске — читалка просто забудет про эту базу.'))return;
+    if(act==='ro'&&!confirm('Сменить режим базы «'+name+'»?'))return;
+    b.disabled=true;
+    const body={act:{open:'open',forget:'forget',load:'load',ro:'readonly'}[act],id};
+    if(act==='ro')body.on=b.textContent.indexOf('только')===0;
+    try{
+      const r=await fetch('/api/bases',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json();
+      if(!r.ok||!j.ok){say(j.error||'не вышло','bad');b.disabled=false;return}
+      if(act==='open'){location.href='/';return}
+      if(act==='load'){watchLoad();return}
+      say('готово','ok');
+      loadBases();
+    }catch(err){say('сервер не ответил','bad');b.disabled=false}
+  });
+
+  /* ---- что нового в ENOT ---- */
+  const rbox=$('#bs-remote'), pullBtn=$('#bs-pull');
+  const RST={new:'нет в базе',changed:'изменён в ENOT',gone:'убран из ENOT'};
+
+  const drawRemote=rows=>{
+    if(!rows||!rows.length){
+      rbox.innerHTML='<div class="ag-empty">Ничего нового.</div>';
+      pullBtn.disabled=true;return;
+    }
+    rbox.innerHTML=rows.map(r=>
+      '<div class="sy" data-id="'+esc(r.id)+'">'+
+      (r.state==='gone'?'<span class="chk-off">—</span>':
+        '<input type="checkbox" class="chk" '+(r.state==='new'?'checked':'')+'>')+
+      '<div class="col"><div class="nm">'+esc(r.title)+'</div>'+
+      '<div class="sub">'+esc(r.rel||'новая папка')+
+      (r.updated?('  ·  правился '+esc(r.updated)):'')+
+      (r.chars?('  ·  '+r.chars+' знаков'):'')+'</div></div>'+
+      '<span class="st '+(r.state==='new'?'new':r.state==='gone'?'empty':'changed')+
+      '">'+(RST[r.state]||r.state)+'</span></div>').join('');
+    pullBtn.disabled=false;
+  };
+
+  const loadRemote=async()=>{
+    try{
+      const r=await fetch('/api/bases/remote');
+      const d=await r.json();
+      drawRemote(d.rows);
+      const t=d.task||{};
+      if(t.state==='running'){sayc(t.text||'смотрю ENOT…');setTimeout(loadRemote,1500)}
+      else if(t.state==='error')sayc(t.error||'не вышло','bad');
+      else if(d.at)sayc('проверено: '+new Date(d.at*1000).toLocaleTimeString('ru'));
+    }catch(e){sayc('сервер не ответил','bad')}
+  };
+
+  $('#bs-check')?.addEventListener('click',async e=>{
+    sayc('спрашиваю ENOT…');
+    try{
+      const r=await fetch('/api/bases',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:'check'})});
+      const j=await r.json();
+      if(!r.ok||!j.ok){sayc(j.error||'не вышло','bad');return}
+      loadRemote();
+    }catch(err){sayc('сервер не ответил','bad')}
+  });
+
+  pullBtn?.addEventListener('click',async e=>{
+    const ids=Array.from(rbox.querySelectorAll('.sy')).filter(
+      x=>x.querySelector('.chk')&&x.querySelector('.chk').checked)
+      .map(x=>x.dataset.id);
+    if(!ids.length){sayc('ничего не отмечено','bad');return}
+    if(!confirm('Забрать из ENOT '+ids.length+' документов?\n'+
+      'Отмеченные изменённые будут перезаписаны — остальное не тронется.'))return;
+    e.currentTarget.disabled=true;
+    sayc('забираю…');
+    try{
+      const r=await fetch('/api/bases',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({act:'pull',ids})});
+      const j=await r.json();
+      if(!r.ok||!j.ok)sayc(j.error||'не вышло','bad');
+      else sayc('создано: '+j.made+', обновлено: '+j.updated,'ok');
+      loadRemote();loadBases();
+    }catch(err){sayc('сервер не ответил','bad')}
+    e.currentTarget.disabled=false;
+  });
+
+  loadBases();
+  loadRemote();
+}
 })();
 """
 
@@ -1177,6 +1419,7 @@ def shell(title, tree, active, head, body, toc, nav, can_write=False,
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)}</title>
+{favicon.LINKS}
 <style>{theme.CSS}</style></head>
 <body class="theme-dark font-serif" data-write="{'1' if can_write else '0'}">
 <div class="app">
@@ -1190,6 +1433,7 @@ def shell(title, tree, active, head, body, toc, nav, can_write=False,
       <button class="tb" id="t-wide" title="Ширина колонки">&#8596;</button>
       <button class="tb" id="t-map" title="Карта главы">&#9776;</button>
       {hb}
+      <a class="tb" href="/bases" title="Базы документов">&#9707;</a>
       <a class="tb" href="/agents" title="Агенты: кто берёт замечания в работу">&#9737;</a>
       <a class="tb" href="/sync" title="Выгрузка в ENOT">&#8593;E</a>
       <button class="tb" id="t-theme" title="Тема">&#9681;</button>
@@ -1318,6 +1562,60 @@ def agents_page():
             '</div>')
 
 
+def bases_page():
+    """Страница «Базы»: какие базы есть, какая открыта, как завести новую.
+
+    База — отдельная папка со своими документами, версиями и замечаниями.
+    Базы не пересекаются: это проверяется при создании, а не держится на
+    памяти. Загрузка идёт один раз в пустую папку и ничего не перезаписывает.
+    """
+    return ('<div class="ag-page">'
+            '<h1>Базы документов</h1>'
+            '<p class="ag-lead">База — отдельная папка со своими документами, '
+            'версиями и замечаниями. Базы не пересекаются: новая папка не может '
+            'лежать внутри уже подключённой, а загрузка идёт только в пустую '
+            'папку. Готовое не перезаписывается.</p>'
+            '<div id="bs-list" class="ag-list">загружаю…</div>'
+            '<h2 class="ag-h">Новая база</h2>'
+            '<div class="ag-form">'
+            '<p class="ag-hint">Имя должно отличаться от имён уже подключённых '
+            'баз. Папку укажите пустую или несуществующую — читалка создаст её '
+            'сама. Загрузка идёт один раз: дальше база живёт своей жизнью, '
+            'и проверка только показывает, что появилось в ENOT.</p>'
+            '<label>Имя базы<input id="bs-name" placeholder="Енот 2"></label>'
+            '<label>Папка на диске'
+            '<input id="bs-path" placeholder="C:\\Users\\andrn\\Desktop\\Енот 2">'
+            '</label>'
+            '<label>Откуда загружать'
+            '<select id="bs-src">'
+            '<option value="enot">из ENOT по сети — всё, что есть сейчас</option>'
+            '<option value="backup">из папки бэкапа на этом компьютере</option>'
+            '<option value="local">не загружать — пустая база</option>'
+            '</select></label>'
+            '<label id="bs-fromwrap" style="display:none">Папка бэкапа'
+            '<input id="bs-from" placeholder="C:\\Users\\andrn\\Desktop\\Yonote\\Backup\\...">'
+            '</label>'
+            '<div class="ag-row">'
+            '<button id="bs-make" class="prim">создать и загрузить</button>'
+            '<span id="bs-msg" class="ag-msg"></span>'
+            '</div>'
+            '<div id="bs-prog" class="bs-prog" hidden>'
+            '<div class="bar"><i></i></div><div class="txt"></div></div>'
+            '</div>'
+            '<h2 class="ag-h">Что нового в ENOT</h2>'
+            '<p class="ag-hint">Читалка сама смотрит витрину раз в час и '
+            'подсвечивает находки. Ничего не забирается без вашего согласия: '
+            'отметьте нужное и нажмите «забрать отмеченное».</p>'
+            '<div class="ag-row">'
+            '<button id="bs-check">проверить сейчас</button>'
+            '<button id="bs-pull" class="prim" disabled>забрать отмеченное</button>'
+            '<span id="bs-cmsg" class="ag-msg"></span>'
+            '</div>'
+            '<div id="bs-remote" class="ag-list"></div>'
+            '<p class="ag-note" id="bs-where"></p>'
+            '</div>')
+
+
 def sync_page():
     """Страница выгрузки в ENOT: что расходится и что отправить.
 
@@ -1384,6 +1682,20 @@ KIND_RU = {
 }
 
 
+_ICONS = {}
+
+
+def _icon_cached(kind):
+    """Растровый значок. Рисуется один раз за запуск: 180 точек — это работа.
+
+    Значок не меняется, поэтому держим готовые байты в памяти, а браузеру
+    отдаём с длинным сроком кеша.
+    """
+    if kind not in _ICONS:
+        _ICONS[kind] = favicon.ico() if kind == 'ico' else favicon.png(180)
+    return _ICONS[kind]
+
+
 def history_html(full):
     """Паспорт документа: лента событий по всем версиям, свежие сверху."""
     h = notes.load_history(full)
@@ -1426,14 +1738,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, data, ctype='text/html; charset=utf-8', code=200):
+    def _send(self, data, ctype='text/html; charset=utf-8', code=200,
+              cache='no-store'):
         if isinstance(data, str):
             data = data.encode('utf-8')
         try:
             self.send_response(code)
             self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', cache)
             self.end_headers()
             self.wfile.write(data)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
@@ -1443,6 +1756,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(u.query)
+
+        # значок вкладки: рисуется кодом, поэтому файлов на диске нет.
+        # Отдаём с долгим кешем — картинка не меняется между запусками.
+        if u.path in ('/favicon.svg', '/favicon.ico', '/favicon-180.png'):
+            if u.path == '/favicon.svg':
+                blob, ctype = favicon.SVG.encode('utf-8'), 'image/svg+xml'
+            elif u.path == '/favicon.ico':
+                blob, ctype = _icon_cached('ico'), 'image/x-icon'
+            else:
+                blob, ctype = _icon_cached('png180'), 'image/png'
+            self._send(blob, ctype, cache='public, max-age=604800')
+            return
+
         tree = build_tree()
         docs = flat_docs(tree)
 
@@ -1682,6 +2008,41 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': True, 'items': items})
             return
 
+        if u.path == '/bases':
+            self._send(shell('Базы', tree_html(tree, None), None, '',
+                             bases_page(), [], (None, None)))
+            return
+
+        if u.path == '/api/bases':
+            """Список баз: какая открыта, сколько документов, откуда пришла."""
+            data = bases.load(CFG.get('base'))
+            out = []
+            for b in data['bases']:
+                out.append(dict(b, exists=os.path.isdir(b['path']),
+                                docs_now=bases.count_docs(b['path'])
+                                if os.path.isdir(b['path']) else 0,
+                                current=b['id'] == data['current']))
+            self._json({'ok': True, 'bases': out, 'current': data['current'],
+                        'registry': bases.reg_path(),
+                        'suggest': bases.suggest_dir(data),
+                        'key': bool(sync_yonote.api_key(CFG)),
+                        'load': LOAD_TASK.snapshot()})
+            return
+
+        if u.path == '/api/bases/load':
+            """Как идёт загрузка базы."""
+            self._json({'ok': True, 'task': LOAD_TASK.snapshot()})
+            return
+
+        if u.path == '/api/bases/remote':
+            """Что нашла проверка витрины. Ничего не меняет."""
+            data = bases.load(CFG.get('base'))
+            rows = REMOTE['rows'] if REMOTE['base'] == data['current'] else []
+            self._json({'ok': True, 'task': SCAN_TASK.snapshot(),
+                        'rows': rows, 'base': REMOTE['base'],
+                        'at': round(REMOTE['at'])})
+            return
+
         self._send('<h1>404</h1>', code=404)
 
     # ------------------------------------------------------------ запись
@@ -1897,6 +2258,16 @@ class Handler(BaseHTTPRequestHandler):
             if not full or not os.path.isfile(full):
                 self._json({'ok': False, 'error': 'Документ не найден'}, code=404)
                 return
+            # база, загруженная из ENOT, по умолчанию только читается: иначе
+            # случайное нажатие заменило бы в витрине документ, оформленный
+            # в браузере. Режим снимается на странице «Базы» осознанно.
+            b = bases.current(bases.load(CFG.get('base')))
+            if b and b.get('read_only'):
+                self._json({'ok': False,
+                            'error': f'база «{b["name"]}» открыта только для '
+                                     f'чтения — выгрузка запрещена. Снять запрет '
+                                     f'можно на странице «Базы»'}, code=403)
+                return
             ok, msg = sync_yonote.push(full, CFG, force=bool(data.get('force')))
             if not ok:
                 self._json({'ok': False, 'error': msg}, code=502)
@@ -1956,6 +2327,198 @@ class Handler(BaseHTTPRequestHandler):
                     done += 1
                 refresh(force=True)
                 self._json({'ok': True, 'count': done})
+                return
+
+            self._json({'ok': False, 'error': 'неизвестное действие'}, code=400)
+            return
+
+        if u.path == '/api/bases':
+            """Базы: создать, открыть, забыть, дозагрузить.
+
+            Все запреты живут в `bases.check_new`, а не здесь: правило «база
+            записывается один раз и не перезаписывается» должно работать и при
+            запуске из командной строки, а не только через эту страницу.
+            """
+            act = (data.get('act') or '').strip()
+            reg = bases.load(CFG.get('base'))
+
+            if act == 'create':
+                name = (data.get('name') or '').strip()
+                path = (data.get('path') or '').strip()
+                src = (data.get('source') or 'enot').strip()
+                frm = (data.get('from') or '').strip()
+
+                if src == 'enot' and not sync_yonote.api_key(CFG):
+                    self._json({'ok': False,
+                                'error': 'нет ключа доступа к ENOT — добавьте '
+                                         'YONOTE_API_KEY в .env'}, code=400)
+                    return
+                if src == 'backup' and not frm:
+                    self._json({'ok': False,
+                                'error': 'укажите папку бэкапа'}, code=400)
+                    return
+                if LOAD_TASK.busy():
+                    self._json({'ok': False,
+                                'error': 'уже идёт загрузка другой базы'},
+                               code=409)
+                    return
+
+                entry, err = bases.add(name, path, source=src,
+                                       site=CFG.get('yonote_url', ''),
+                                       # база из ENOT по умолчанию только
+                                       # читается: витрина уже оформлена руками,
+                                       # и случайная выгрузка стёрла бы это.
+                                       # Пустая база создаётся для работы,
+                                       # значит выгрузка ей нужна сразу.
+                                       read_only=(src != 'local'), data=reg)
+                if err:
+                    self._json({'ok': False, 'error': err}, code=400)
+                    return
+
+                try:
+                    os.makedirs(settings.translate(entry['path']), exist_ok=True)
+                except OSError as e:
+                    bases.forget(entry['id'])
+                    self._json({'ok': False, 'error': f'папку создать не вышло: {e}'},
+                               code=400)
+                    return
+
+                if src == 'local':
+                    self._json({'ok': True, 'base': entry, 'loading': False,
+                                'message': 'база создана, папка пустая'})
+                    return
+
+                def job(task, entry=entry, src=src, frm=frm):
+                    if src == 'backup':
+                        n, err = import_enot.from_backup(
+                            entry, frm, progress=lambda t, k=0: task.say(t, k))
+                    else:
+                        n, err = import_enot.first_load(
+                            entry, CFG, progress=lambda t, k=0: task.say(t, k))
+                    if err and not n:
+                        raise RuntimeError(err)
+                    bases.mark_loaded(entry['id'], bases.count_docs(entry['path']))
+                    task.say(f'загружено документов: {n}', n)
+                    return {'written': n, 'warning': err}
+
+                LOAD_TASK.start(job, tag=entry['id'])
+                self._json({'ok': True, 'base': entry, 'loading': True,
+                            'message': 'загружаю — можно закрыть страницу, '
+                                       'работа не прервётся'})
+                return
+
+            if act == 'open':
+                b, err = bases.set_current((data.get('id') or '').strip())
+                if err:
+                    self._json({'ok': False, 'error': err}, code=400)
+                    return
+                use_base(b['path'])
+                docs = flat_docs(build_tree())
+                self._json({'ok': True, 'base': b, 'docs': len(docs)})
+                return
+
+            if act == 'forget':
+                b, err = bases.forget((data.get('id') or '').strip())
+                if err:
+                    self._json({'ok': False, 'error': err}, code=400)
+                    return
+                self._json({'ok': True, 'base': b})
+                return
+
+            if act == 'rename':
+                bid = (data.get('id') or '').strip()
+                name = (data.get('name') or '').strip()
+                if not name:
+                    self._json({'ok': False, 'error': 'нужно имя'}, code=400)
+                    return
+                if any(x['name'].lower() == name.lower() and x['id'] != bid
+                       for x in reg['bases']):
+                    self._json({'ok': False,
+                                'error': f'имя «{name}» уже занято'}, code=400)
+                    return
+                b, err = bases.update(bid, name=name)
+                if err:
+                    self._json({'ok': False, 'error': err}, code=400)
+                    return
+                self._json({'ok': True, 'base': b})
+                return
+
+            if act == 'readonly':
+                b, err = bases.update((data.get('id') or '').strip(),
+                                      read_only=bool(data.get('on', True)))
+                if err:
+                    self._json({'ok': False, 'error': err}, code=400)
+                    return
+                self._json({'ok': True, 'base': b})
+                return
+
+            if act == 'load':
+                # дозагрузка: базу создали пустой, а наполнить решили позже
+                b = bases.get((data.get('id') or '').strip(), reg)
+                if not b:
+                    self._json({'ok': False, 'error': 'база не найдена'}, code=404)
+                    return
+                if LOAD_TASK.busy():
+                    self._json({'ok': False, 'error': 'уже идёт загрузка'},
+                               code=409)
+                    return
+                err = import_enot.check_target(b['path'])
+                if err:
+                    self._json({'ok': False, 'error': err}, code=409)
+                    return
+                frm = (data.get('from') or '').strip()
+
+                def job2(task, b=b, frm=frm):
+                    if frm:
+                        n, err = import_enot.from_backup(
+                            b, frm, progress=lambda t, k=0: task.say(t, k))
+                    else:
+                        n, err = import_enot.first_load(
+                            b, CFG, progress=lambda t, k=0: task.say(t, k))
+                    if err and not n:
+                        raise RuntimeError(err)
+                    bases.mark_loaded(b['id'], bases.count_docs(b['path']))
+                    return {'written': n, 'warning': err}
+
+                LOAD_TASK.start(job2, tag=b['id'])
+                self._json({'ok': True, 'loading': True})
+                return
+
+            if act == 'check':
+                b = bases.current(reg)
+                if not b:
+                    self._json({'ok': False, 'error': 'нет открытой базы'},
+                               code=400)
+                    return
+                if not sync_yonote.api_key(CFG):
+                    self._json({'ok': False, 'error': 'нет ключа доступа к ENOT'},
+                               code=400)
+                    return
+                ok, msg = start_scan(b)
+                self._json({'ok': ok, 'error': '' if ok else msg,
+                            'message': msg}, code=200 if ok else 409)
+                return
+
+            if act == 'pull':
+                b = bases.current(reg)
+                if not b:
+                    self._json({'ok': False, 'error': 'нет открытой базы'},
+                               code=400)
+                    return
+                ids = [str(x) for x in (data.get('ids') or [])]
+                if not ids:
+                    self._json({'ok': False, 'error': 'ничего не отмечено'},
+                               code=400)
+                    return
+                made, upd, err = import_enot.pull(b, CFG, ids)
+                if err:
+                    self._json({'ok': False, 'error': err}, code=502)
+                    return
+                REMOTE['rows'] = [r for r in REMOTE['rows']
+                                  if r['id'] not in set(ids)]
+                refresh(force=True)
+                bases.mark_loaded(b['id'], bases.count_docs(b['path']))
+                self._json({'ok': True, 'made': made, 'updated': upd})
                 return
 
             self._json({'ok': False, 'error': 'неизвестное действие'}, code=400)
@@ -2046,17 +2609,28 @@ def main():
         sys.exit(1)
 
     BASE = os.path.abspath(a.base)
+    CFG['base'] = BASE
     if not os.path.isdir(BASE):
         print(f'нет папки базы: {BASE}')
         sys.exit(1)
 
-    print(f'база: {BASE}')
+    reg = bases.load(BASE)
+    cur = bases.current(reg)
+    if cur:
+        print(f'база: {cur["name"]} — {BASE}')
+        if len(reg['bases']) > 1:
+            others = ', '.join(b['name'] for b in reg['bases']
+                               if b['id'] != cur['id'])
+            print(f'другие базы: {others}  (переключение на /bases)')
+    else:
+        print(f'база: {BASE}')
     print('читаю базу…', flush=True)
     t0 = time.time()
     refresh(force=True)
     docs = flat_docs(build_tree())
     print(f'документов: {len(docs)}  ({time.time() - t0:.1f} с)')
     threading.Thread(target=watcher, daemon=True).start()
+    threading.Thread(target=enot_watcher, daemon=True).start()
     print(f'открыть: http://localhost:{a.port}')
     if a.host == '0.0.0.0':
         allow = CFG.get('write_allow') or []
