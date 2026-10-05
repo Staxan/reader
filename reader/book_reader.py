@@ -541,7 +541,8 @@ function openForm(anchor){
     'выделенному тексту…"></textarea>'+
     '<div class="foot"><span>Ctrl+Enter — сохранить, Esc — отменить</span>'+
     '<span class="sp"><button data-a="cancel">Отменить</button>'+
-    '<button class="ok" data-a="save">Сохранить</button></span></div>';
+    '<button class="ok" data-a="save">Сохранить</button>'+
+    '<button class="reply" data-a="reply">Ответить</button></span></div>';
   f.querySelector('.cite').textContent=anchor.text;
   host.insertAdjacentElement('afterend',f);
   const ta=f.querySelector('textarea');
@@ -563,6 +564,8 @@ function openForm(anchor){
   });
   f.querySelector('[data-a="save"]').addEventListener('click',
     ()=>saveNote(anchor,ta.value));
+  f.querySelector('[data-a="reply"]').addEventListener('click',
+    ()=>replyNote(anchor,ta.value));
   f.querySelector('[data-a="cancel"]').addEventListener('click',()=>closeForm(true));
 
   /* клик по свободному месту сохраняет написанное */
@@ -593,6 +596,21 @@ async function saveNote(anchor,comment){
     say('Замечание сохранено');
     location.reload();
   }catch(e){say('Сервер не ответил, замечание осталось в поле',3600)}
+}
+
+async function replyNote(anchor,comment){
+  const v=(comment||'').trim();
+  if(!v){say('Сначала напишите замечание');return}
+  const b=$('.qform [data-a="reply"]');
+  if(b)b.disabled=true;
+  try{
+    const r=await fetch('/api/reply',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({p:window.__doc,block:anchor.block,text:anchor.text,occ:anchor.occ,comment:v})});
+    const d=await r.json();
+    if(!r.ok||!d.ok){say(d.error||'Не удалось отправить в работу',3600);if(b)b.disabled=false;return}
+    localStorage.removeItem(DRAFT); rememberPos(d.id); closeForm(false); pollJob();
+    say(d.sent?'Отправлено Нике':'Замечание сохранено, но агент недоступен',3600);
+  }catch(e){say('Сервер не ответил, замечание осталось в поле',3600);if(b)b.disabled=false}
 }
 
 $('#sb-quote')?.addEventListener('click',()=>{
@@ -2135,6 +2153,42 @@ class Handler(BaseHTTPRequestHandler):
                       'bhash': notes.text_hash(btext)}
             note = notes.add_note(full, anchor, comment)
             self._json({'ok': True, 'id': note['id']})
+            return
+
+        if u.path == '/api/reply':
+            full = self._target(data.get('p'))
+            if not full:
+                return
+            blocks = structure.parse(open(full, encoding='utf-8').read())
+            bi = data.get('block')
+            if not isinstance(bi, int) or bi < 0 or bi >= len(blocks):
+                self._json({'ok': False, 'error': 'Не понял, к какому абзацу'}, code=400)
+                return
+            frag = (data.get('text') or '').strip()
+            btext = blocks[bi].get('text') or ''
+            if not frag or frag not in btext:
+                self._json({'ok': False, 'error': 'Выделенный текст не найден в абзаце'}, code=400)
+                return
+            comment = (data.get('comment') or '').strip()
+            if not comment:
+                self._json({'ok': False, 'error': 'Пустое замечание'}, code=400)
+                return
+            anchor = {'block': bi, 'text': frag,
+                      'occ': int(data.get('occ') or 0),
+                      'bhash': notes.text_hash(btext)}
+            note = notes.add_note(full, anchor, comment)
+            who = binding.label(full, BASE)
+            job, err = jobs.create(full, agent_id=who['id'], agent_name=who['name'])
+            if err:
+                self._json({'ok': False, 'error': err, 'id': note['id']}, code=409)
+                return
+            rel = os.path.relpath(full, BASE).replace(os.sep, '/')
+            agent = registry.get(who['id']) if who['id'] else None
+            ok, msg = agents.send(agent, rel, job)
+            if not ok:
+                jobs.add_step(full, msg, state='wait')
+            self._json({'ok': True, 'id': note['id'], 'sent': ok,
+                        'message': msg, 'agent': who['name']})
             return
 
         if u.path == '/api/version':
